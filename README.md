@@ -76,6 +76,7 @@ This project was originally deployed on a UIUC-managed virtual machine (VM) as p
 
 
 💡 What I Learned
+
 Asynchronous programming and WebSocket management in Python
 
 Game server architecture and real-time state synchronization
