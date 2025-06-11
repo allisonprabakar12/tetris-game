@@ -1,15 +1,8 @@
 from aiohttp import web, WSMsgType
-import asyncio
-import random
-import tilestub
-from aiohttp.web import FileResponse
+import aiohttp, asyncio
+import copy
+import random 
 
-
-routes = web.RouteTableDef()
-
-playws = {} # used to track open websockets to support graceful shutdown on Ctrl+C
-watchws = set()
-watchmap = {}
 shapes = {
     1: [[[0,0],[1,0],[0,-1],[1,-1]]],
     2: [[(0,0),(0,-1),(0,-2),(0,-3)], [(-1,0),(0,0),(1,0),(2,0)]],
@@ -23,225 +16,187 @@ shapes = {
     7: [[(1,-2),(1,-1),(0,-1),(0,0)], [(-1,-1),(0,-1),(0,0),(1,0)]]
 }
 
-async def send_to(ws, msg):
-    await ws.send_json(msg)
-    for watcher, target_id in watchmap.items():
-        if target_id == id(ws):
-            try:
-                await watcher.send_json(msg)
-            except:
-                pass  # ignore broken watchers
+def choose_moves(data):
+   board = data.get("board")
+   if board is None:
+       return ['drop']
+   shape_id = data["next"]
+   best_move = None
+   best_score = float('-inf')
+
+   for rot, offsets in enumerate(shapes[shape_id]):
+       min_dx = min(x for x, y in offsets)
+       max_dx = max(x for x, y in offsets)
+       for x in range(-min_dx, 10 - max_dx):
+           y = 0
+           while valid(board, shape_id, rot, x, y + 1):
+               y += 1
+           if not valid(board, shape_id, rot, x, y):
+               continue
+
+           sim = board[:]
+           for dx, dy in offsets:
+               cx, cy = x + dx, y + dy
+               if 0 <= cy < 20:
+                   sim[cy] |= shape_id << ((9 - cx) * 3)
+
+           cleared = sum(
+               1 for row in sim if all(((row >> (3 * i)) & 0b111) != 0 for i in range(10))
+           )
+
+           holes = 0
+           for col in range(10):
+               found = False
+               for row in range(20):
+                   val = (sim[row] >> (3 * (9 - col))) & 0b111
+                   if val != 0:
+                       found = True
+                   elif found:
+                       holes += 1
+
+           heights = [
+               20 - next((i for i in range(20) if ((sim[i] >> (3 * (9 - col))) & 0b111) != 0), 20)
+               for col in range(10)
+           ]
+
+           bumpiness = sum(abs(heights[i] - heights[i + 1]) for i in range(9))
+           max_height = max(heights)
+
+           score = (
+               cleared * 200        
+               - holes * 80         
+               - bumpiness * 0.8    
+               - max_height * 1.5   
+               + x * 0.3            
+           )
+
+           if score > best_score:
+               best_score = score
+               best_move = (rot, x)
+   if best_move is None:
+       return ['drop']
+   target_rot, target_x = best_move
+   moves = []
+   cur_rot, cur_x = 0, 4
+   rot_diff = (target_rot - cur_rot) % len(shapes[shape_id])
+   if rot_diff > 2:
+       moves += ['ccw'] * (4 - rot_diff)
+   else:
+       moves += ['cw'] * rot_diff
+   dx = target_x - cur_x
+   moves += ['left'] * (-dx) if dx < 0 else ['right'] * dx
+   moves.append('drop')
+   return moves
 
 
-class TetrisGame:
-    def __init__(self, ws):
-        self.ws = ws
-        self.board = [0]*20
-        self.next = tilestub.new_tile()
-        self.spawn()
-        self.task = asyncio.create_task(self.fallLoop())
+def valid(board, s, o, x, y):
+    for dx, dy in shapes[s][o]:
+        nx, ny = x + dx, y + dy
+        if not (0 <= nx < 10 and 0 <= ny < 20):
+            return False
+        if ((board[ny] >> (3 * (9 - nx))) & 0b111) != 0:
+            return False
+    return True
 
-    def spawn(self):
-        s = self.next
-        o = 0
-        x = 4
-        min_dy = min(dy for _, dy in shapes[s][o])
-        start_y = -min_dy
-        for y in range(start_y, 20):
-            if self.valid(s, o, x, y):
-                self.live = (s, o, x, y)
-                self.next = tilestub.new_tile()
-                self.send(include_board=True)
-                return
-        asyncio.create_task(self.ws.send_json({"event": "gameover"}))
-        self.task.cancel()
-            
-
-    def valid(self, s, o, x, y):
-        for dx, dy in shapes[s][o]:
-            nx, ny = x + dx, y + dy
-            if not (0 <= nx < 10 and 0 <= ny < 20):
-                return False
-            cell = (self.board[ny] >> ((9 - nx) * 3)) & 0b111
-            if cell != 0:
-                return False
-        return True
-
-    def fall(self):
-        s, o, x, y = self.live
-        if self.valid(s, o, x, y + 1):
-            self.live = (s, o, x, y + 1)
-            self.send()
-        else:
-            for dx, dy in shapes[s][o]:
-                cx, cy = x + dx, y + dy
-                if 0 <= cy < 20:
-                    self.board[cy] |= s << ((9 - cx) * 3)
-            self.clear()
-            self.send(include_board=True)
-            self.spawn()
-
-    def drop(self):
-        s, o, x, y = self.live
-        while self.valid(s, o, x, y + 1):
-            y += 1
-        self.live = (s, o, x, y)
-        self.fall()
-
-    def clear(self):
-        self.board = [row for row in self.board if any(((row >> (3*i)) & 0b111) == 0 for i in range(10))]
-        self.board = [0] * (20 - len(self.board)) + self.board
-
-    def move(self, dx):
-        s, o, x, y = self.live
-        if self.valid(s, o, x + dx, y):
-            self.live = (s, o, x + dx, y)
-            self.send()
-    
-    def rotate(self, dir):
-        s, o, x, y = self.live
-        no = (o + dir) % len(shapes[s])
-
-        if self.valid(s, no, x, y):
-            self.live = (s, no, x, y)
-            self.send()
-            return True
-        
-        kick_allowed = False
-        for dx, dy in shapes[s][no]:
-            nx, ny = x + dx, y + dy
-            if nx <= 0 or nx >= 9 or ny < 0:
-                kick_allowed = True
-                break
-
-        if kick_allowed:
-            if self.valid(s, no, x, y + 1):
-                self.live = (s, no, x, y + 1)
-                self.send()
-                return True
-
-            for shift in [1, -1, 2, -2]:
-                if self.valid(s, no, x + shift, y):
-                    self.live = (s, no, x + shift, y)
-                    self.send()
-                    return True
-        return False
-
-    def dropDistance(self):
-        s, o, x, y = self.live
-        d = 0
-        while self.valid(s, o, x, y + d + 1):
-            d += 1
-        return d
-
-    def send(self, event = None, include_board=False):
-        s, o, x, y = self.live
-
-        msg = {
-            "live": [s, o, x, y, self.dropDistance()],
-            "next": self.next,
-           
-        }
-        if include_board or event == "lock":
-            msg["board"] = self.board
-        if event:
-            msg["event"] = event
-        asyncio.create_task(send_to(self.ws, msg))
-
-    async def fallLoop(self):
-        try:
-            while True:
-                await asyncio.sleep(0.5)
-                self.fall()
-        except asyncio.CancelledError:
-            pass
-    
-    def cancel(self):
-        self.task.cancel()
-
-
-
-
-@routes.get('/ws')
-async def websocket_handler(request : web.Request) -> web.WebSocketResponse:
-    """The main event loop: accepts connections, manages games, cleans up"""
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    playws[id(ws)] = ws
-    
-    ... # FIX ME: initialize a game for this websocket
-    game = TetrisGame(ws)
-
-    async for msg in ws:
-        
-        if msg.type == WSMsgType.TEXT:
-             # FIX ME: process user event from msg.data
-            if msg.data == 'left': game.move(-1)
-            elif msg.data == 'right': game.move(1)
-            elif msg.data == 'down': game.fall()
-            elif msg.data == 'drop': game.drop()
-            elif msg.data == 'cw': game.rotate(1)
-            elif msg.data == 'ccw': game.rotate(-1)
-        
-        elif msg.type == WSMsgType.ERROR:
-            print(f'WebSocket received exception {ws.exception()}')
-    game.task.cancel()
-    del playws[id(ws)]
-    return ws
-
-@routes.get('/watch')
-async def watch_html(req: web.Request) -> web.FileResponse:
-    return FileResponse(path="watch.html")
-
-@routes.get('/snoop')
-async def snoop(req: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse()
-    await ws.prepare(req)
-    watchws.add(ws)
-
+async def play_games(client, url):
+    """Main game connection and play logic."""
+    alltasks.add(asyncio.current_task())
+    asyncio.current_task().add_done_callback(taskdone)
     try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                if msg.data == "?":
-                    await ws.send_json({"alive": list(playws.keys())})
-                elif msg.data.isdigit() and int(msg.data) in playws:
-                    watchmap[ws] = int(msg.data)
-            elif msg.type == WSMsgType.ERROR:
-                print("Watcher error:", ws.exception())
-    finally:
-        watchws.discard(ws)
-        watchmap.pop(ws, None)
+        while True:
+            await asyncio.sleep(2) # pause between games; feel free to change this
+            try: ws = await client.ws_connect(url)
+            except:
+                print('Game server at', url, 'did not let the bot play')
+                return
+            wsoftask[asyncio.current_task()] = ws
+            print('Starting a new game')
+            async for msg in ws:
+                if msg.type == WSMsgType.TEXT:
+                    data = msg.json() # parse message from server
+                    
+                    
+                    # replace code starting here
+                    if 'event' in data: # game over
+                        print('EVENT:', data['event'])
+                        await ws.close() # MUST keep this to avoid infinite wait on ended game
+                    elif 'next' in data: # 'next' is given when a new tetromino appears
+                        await asyncio.sleep(random.uniform(1.0, 2.0))  # pause to not look AI-like
+                        moves = choose_moves(data)
+                        for move in moves:
+                            await asyncio.sleep(random.uniform(0.3, 0.6))
+                            if random.random() < 0.98:
+                                await ws.send_str(move) # take action
+                    # replace code above here
+                    
+                    
+                elif msg.type == WSMsgType.ERROR:
+                    print(f'connection to {url} received {ws.exception()}')
+            
+    except BaseException as ex:
+        print("Game terminated with exception:\n   ", type(ex),'\n   ', ex)
 
-    return ws
 
+# Written by course staff. Do not edit.
+routes = web.RouteTableDef()
+alltasks = set() # track tasks we might need to cancel if the server stops
+wsoftask = {}    # when a task opens a ws, that is added here
+
+def taskdone(task):
+    """Written by course staff. Do not edit.
+    Helper method to clean up ws and tasks"""
+    alltasks.discard(task)
+    if task in wsoftask:
+        asyncio.create_task(wsoftask[task].close())
+        del wsoftask[task]
 
 @routes.get('/')
-async def index(req : web.Request) -> web.FileResponse:
-    """A simple method for sharing the index.html with players"""
-    return FileResponse(path="index.html")
+async def get_html(request):
+    """Written by course staff. Do not edit.
+    Returns the HTML user interface"""
+    return web.FileResponse("botui.html")
 
-async def shutdown_ws(app: web.Application) -> None:
-    """Ctrl+C won't work right unless we close any open websockets,
-    so this function does that."""
-    for other in tuple(playws):
-        await playws[other].close()
-    for watcher in tuple(watchws):
-        await watcher.close()
+@routes.post('/server')
+async def play_on_server(request):
+    """Written by course staff. Do not edit.
+    Connects the bot to a server"""
+    url = await request.text()
+    alltasks.add(asyncio.create_task(play_games(request.app['client'], url)))
+    return web.Response(status=200, text="OK")
 
-def setup_app(app: web.Application) -> None:
-    """Registers routes and any setup and shutdown handlers needed
-    The default provided with the MP is probablt sufficient"""
+@routes.get('/stopall')
+async def get_html(request):
+    """Written by course staff. Do not edit.
+    Returns the HTML user interface"""
+    for task in tuple(alltasks):
+        try: task.cancel()
+        except: pass
+    return web.Response(status=200, text="OK")
+
+
+async def shutdown_ws(app):
+    """Cleanup"""
+    for task in tuple(alltasks):
+        try: task.cancel()
+        except: pass
+
+async def startup_client(app):
+    """A shared client for better DNS caching"""
+    app['client'] = aiohttp.ClientSession()
+
+async def shutdown_client(app):
+    """Cleanup"""
+    await app['client'].close()
+
+
+def setup_app(app):
+    """Register all the setup and cleanup callbacks"""
+    app.on_startup.append(startup_client)
     app.on_shutdown.append(shutdown_ws)
+    app.on_shutdown.append(shutdown_client)
     app.add_routes(routes)
     
-# To facilitate testing, do not change anything below this line
 if __name__ == '__main__': 
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--host', type=str, default="0.0.0.0")
-    parser.add_argument('-p','--port', type=int, default=10340)
-    args = parser.parse_args()
-
     app = web.Application()
     setup_app(app)
-    web.run_app(app, host=args.host, port=args.port) # this function never returns
+    web.run_app(app, host='0.0.0.0', port=41801) # this function never returns
